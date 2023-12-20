@@ -3,10 +3,10 @@ import base64
 import os
 import time
 from enum import Enum
-from typing import Union, Optional, Dict
+from typing import Union, Optional, Dict, List
 from urllib.parse import quote_plus
 
-from elasticsearch import Elasticsearch
+from elasticsearch import AsyncElasticsearch, Elasticsearch
 from elasticsearch.exceptions import TransportError
 from fastapi import FastAPI, Request, Response, Body, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,11 +52,19 @@ config["debug"] = str(os.getenv("DEBUG", config.get("debug", False))).lower() in
 
 ELASTICSEARCH_INDEX_NAME_PREFIX = os.getenv("ELASTICSEARCH_INDEX_NAME_PREFIX", "")
 
-ES = Elasticsearch(config["eshosts"], **config["esopts"])
+def get_allowed_collections(es: Elasticsearch) -> List[str]:
+    #Only expose indexes with the correct prefix, and add a wildcard as well. 
 
+    all_indexes = [index for index in es.indices.get(index='*')
+                   if index.startswith(ELASTICSEARCH_INDEX_NAME_PREFIX)]
+    all_indexes.append(f"{ELASTICSEARCH_INDEX_NAME_PREFIX}_*")
+    logger.info(f"Exposed indices: {all_indexes}")
+    return all_indexes
+
+es = Elasticsearch(config["eshosts"], **config["esopts"])
 max_retries = 10
 retries = 0
-while not assert_elasticsearch_connection(ES):
+while not assert_elasticsearch_connection(es):
     retries += 1
     if retries < max_retries:
         time.sleep(5)
@@ -64,19 +72,14 @@ while not assert_elasticsearch_connection(ES):
     else:
         raise RuntimeError(f"Elasticsearch connection failed {max_retries} times, giving up.")
 
-
-def get_allowed_collections():
-    #Only expose indexes with the correct prefix, and add a wildcard as well. 
-
-    all_indexes = [index for index in ES.indices.get(index='*') if index.startswith(ELASTICSEARCH_INDEX_NAME_PREFIX)]
-    all_indexes.append(f"{ELASTICSEARCH_INDEX_NAME_PREFIX}_*")
-    logger.info(f"Exposed indices: {all_indexes}")
-    return all_indexes
-
-
-Collection = list_to_enum("Collection", get_allowed_collections())
+Collection = list_to_enum("Collection", get_allowed_collections(es))
 TermField = list_to_enum("TermField", config["termfields"])
 TermAggr = list_to_enum("TermAggr", config["termaggrs"])
+
+del es
+
+
+ES = AsyncElasticsearch(config["eshosts"], **config["esopts"])
 
 tags = [{
     "name": "info",
@@ -398,8 +401,8 @@ def search_root(collection: Collection, req: Request):
                       '</ul>'])
 
 
-def _search_overview(collection: Collection, q: str, req: Request):
-    res = ES.search(index=collection.name, body=cs_overview_query(q))
+async def _search_overview(collection: Collection, q: str, req: Request):
+    res = await ES.search(index=collection.name, body=cs_overview_query(q))
 
     if not res["hits"]["hits"]:
         raise HTTPException(status_code=404, detail="No results found!")
@@ -419,26 +422,26 @@ def _search_overview(collection: Collection, q: str, req: Request):
 
 @v1.get("/{collection}/search/overview", tags=["data"])
 @v1.head("/{collection}/search/overview", include_in_schema=False)
-def search_overview_via_query_params(collection: Collection, q: str, req: Request):
+async def search_overview_via_query_params(collection: Collection, q: str, req: Request):
     """
     Report overview summary of the search result
     """
-    return _search_overview(collection, q, req)
+    return await _search_overview(collection, q, req)
 
 
 @v1.post("/{collection}/search/overview", tags=["data"])
-def search_overview_via_payload(collection: Collection, req: Request, payload: Query):
+async def search_overview_via_payload(collection: Collection, req: Request, payload: Query):
     """
     Report summary of the search result
     """
-    return _search_overview(collection, payload.q, req)
+    return await _search_overview(collection, payload.q, req)
 
 
-def _search_result(collection: Collection, q: str, req: Request, resp: Response, resume: Union[str, None] = None,
+async def _search_result(collection: Collection, q: str, req: Request, resp: Response, resume: Union[str, None] = None,
                    expanded: bool = False, sort_field: str = None,
                    sort_order: str = None, page_size: int = None):
     query = cs_paged_query(q, resume, expanded, sort_field, sort_order, page_size)
-    res = ES.search(index=collection.name, body=query)
+    res = await ES.search(index=collection.name, body=query)
     if not res["hits"]["hits"]:
         raise HTTPException(status_code=404, detail="No results found!")
     base = proxy_base_url(req)
@@ -452,36 +455,36 @@ def _search_result(collection: Collection, q: str, req: Request, resp: Response,
 
 @v1.get("/{collection}/search/result", tags=["data"])
 @v1.head("/{collection}/search/result", include_in_schema=False)
-def search_result_via_query_params(collection: Collection, q: str, req: Request, resp: Response,
-                                   resume: Union[str, None] = None, expanded: bool = False,
-                                   sort_field: Optional[str] = None, sort_order: Optional[str] = None,
-                                   page_size: Optional[int] = None):
+async def search_result_via_query_params(collection: Collection, q: str, req: Request, resp: Response,
+                                         resume: Union[str, None] = None, expanded: bool = False,
+                                         sort_field: Optional[str] = None, sort_order: Optional[str] = None,
+                                         page_size: Optional[int] = None):
     """
     Paged response of search result
     """
-    return _search_result(collection, q, req, resp, resume, expanded, sort_field, sort_order, page_size)
+    return await _search_result(collection, q, req, resp, resume, expanded, sort_field, sort_order, page_size)
 
 
 @v1.post("/{collection}/search/result", tags=["data"])
-def search_result_via_payload(collection: Collection, req: Request, resp: Response, payload: PagedQuery):
+async def search_result_via_payload(collection: Collection, req: Request, resp: Response, payload: PagedQuery):
     """
     Paged response of search result
     """
-    return _search_result(collection, payload.q, req, resp, payload.resume, payload.expanded,
-                          payload.sort_field, payload.sort_order, payload.page_size)
+    return await _search_result(collection, payload.q, req, resp, payload.resume, payload.expanded,
+                                payload.sort_field, payload.sort_order, payload.page_size)
 
 
 if config["debug"]:
     @v1.post("/{collection}/search/esdsl", tags=["debug"])
-    def search_esdsl_via_payload(collection: Collection, payload: dict = Body(...)):
+    async def search_esdsl_via_payload(collection: Collection, payload: dict = Body(...)):
         """
         Search using ES Query DSL as JSON payload
         """
-        return ES.search(index=collection.name, body=payload)
+        return await ES.search(index=collection.name, body=payload)
 
 
-def _get_terms(collection: Collection, q: str, field: TermField, aggr: TermAggr):
-    res = ES.search(index=collection.name, body=cs_terms_query(q, field, aggr))
+async def _get_terms(collection: Collection, q: str, field: TermField, aggr: TermAggr):
+    res = await ES.search(index=collection.name, body=cs_terms_query(q, field, aggr))
     if not res["hits"]["hits"] or not res["aggregations"]["sample"]["topterms"]["buckets"]:
         raise HTTPException(status_code=404, detail="No results found!")
     return format_counts(res["aggregations"]["sample"]["topterms"]["buckets"])
@@ -511,29 +514,29 @@ def term_aggr_root(collection: Collection, req: Request, field: TermField):
 
 @v1.get("/{collection}/terms/{field}/{aggr}", tags=["data"])
 @v1.head("/{collection}/terms/{field}/{aggr}", include_in_schema=False)
-def get_terms_via_query_params(collection: Collection, q: str, field: TermField, aggr: TermAggr):
+async def get_terms_via_query_params(collection: Collection, q: str, field: TermField, aggr: TermAggr):
     """
     Top terms with frequencies in matching articles
     """
-    return _get_terms(collection, q, field.value, aggr.value)
+    return await _get_terms(collection, q, field.value, aggr.value)
 
 
 @v1.post("/{collection}/terms/{field}/{aggr}", tags=["data"])
-def get_terms_via_payload(collection: Collection, payload: Query, field: TermField, aggr: TermAggr):
+async def get_terms_via_payload(collection: Collection, payload: Query, field: TermField, aggr: TermAggr):
     """
     Top terms with frequencies in matching articles
     """
-    return _get_terms(collection, payload.q, field.value, aggr.value)
+    return await _get_terms(collection, payload.q, field.value, aggr.value)
 
 
 @v1.get("/{collection}/article/{id}", tags=["data"])
 @v1.head("/{collection}/article/{id}", include_in_schema=False)
-def get_article(collection: Collection, id: str, req: Request):  # pylint: disable=redefined-builtin
+async def get_article(collection: Collection, id: str, req: Request):  # pylint: disable=redefined-builtin
     """
     Fetch an individual article record by ID
     """
     try:
-        hit = ES.get(index=collection.name, id=decode(id))
+        hit = await ES.get(index=collection.name, id=decode(id))
     except TransportError as e:
         raise HTTPException(status_code=404, detail=f"An article with ID {decode(id)} not found!") from e
     base = proxy_base_url(req)
@@ -546,4 +549,4 @@ app.mount(f"/{ApiVersion.v1.name}", v1)
 if __name__ == "__main__":
     import uvicorn
 
-    uvicorn.run("api:app", host="0.0.0.0", reload=True, root_path=os.getenv("ROOT_PATH", "/"))
+    uvicorn.run("api:app", host="0.0.0.0", reload=True, root_path=os.getenv("ROOT_PATH", "/"), port=9999)
